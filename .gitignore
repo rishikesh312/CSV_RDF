@@ -34,3 +34,5 @@ src/iribaker/
 pip-selfcheck.json
 iribaker
 .vscode
+myvnenv/
+
