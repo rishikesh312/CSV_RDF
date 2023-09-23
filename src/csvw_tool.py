@@ -12,6 +12,7 @@ import argparse
 import sys
 import gzip
 import traceback
+import cProfile
 from glob import glob
 from rdflib import ConjunctiveGraph
 from werkzeug.utils import secure_filename
@@ -119,7 +120,7 @@ def main():
         args.format, args.gzip)
 
 if __name__ == '__main__':
-    main()
+   cProfile.run("main()")
 
 # FILE = '../sdh-private-hisco-datasets/hisco_45.csv'
 # SCHEMA = '../sdh-private-hisco-datasets/hisco_45.csv-metadata.json'
