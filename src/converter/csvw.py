@@ -13,6 +13,7 @@ from chardet.universaldetector import UniversalDetector
 import multiprocessing as mp
 import unicodecsv as csv
 from jinja2 import Template
+from functools import lru_cache
 from .util import (patch_namespaces_to_disk, process_namespaces,
                    get_namespaces, Nanopublication, validateTerm,
                    parse_value, CSVW, PROV, DC, SKOS, RDF)
@@ -487,7 +488,9 @@ class BurstConverter(object):
         self.metadata_graph = metadata_graph
         self.encoding = encoding
         self.output_format = output_format
-
+        self.render_pattern_cache = {}
+        self.expandURL_cache = {}
+        self.get_property_url_cache = {}
         self.templates = {}
 
         self.aboutURLSchema = self.schema.csvw_aboutUrl
@@ -508,6 +511,7 @@ class BurstConverter(object):
     def process(self, count, rows, chunksize):
         """Process the rows fed to the converter. Count and chunksize are used to determine the
         current row number (needed for default observation identifiers)"""
+
         obs_count = count * chunksize
 
         # logger.info("Row: {}".format(obs_count)) #removed for readability
@@ -692,12 +696,18 @@ class BurstConverter(object):
     #     with open(trig_file_name, 'w') as f:
     #         self.np.serialize(f, format='trig')
     #     logger.info("... done")
-
+#        self.render_pattern_cache = {}
+#        self.expandURL_cache = {}
+#        self.get_property_url_cache = {}
     def render_pattern(self, pattern, row):
         """Takes a Jinja or Python formatted string, and applies it to the row value"""
         # Significant speedup by not re-instantiating Jinja templates for every
         # row.
-
+        row_key = frozenset(row.items())
+        cache_key = (pattern,row_key)
+        if cache_key in self.render_pattern_cache:
+            return self.render_pattern_cache[cache_key]
+        
         if pattern in self.templates:
             template = self.templates[pattern]
         else:
@@ -719,14 +729,24 @@ class BurstConverter(object):
         try:
             # We then format the resulting string using the standard Python2
             # expressions
-            return rendered_template.format(**row)
+            result = rendered_template.format(**row)
         except:
             logger.warning(
                 "Could not apply python string formatting, probably due to mismatched curly brackets. IRI will be '{}'. ".format(rendered_template))
-            return rendered_template
+            result = rendered_template.format(**row)
+        
+        self.render_pattern_cache[cache_key] = result
+        return result
 
     def get_property_url(self, csvw_propertyUrl, csvw_name, row):
-         # If propertyUrl is specified, use it, otherwise use the column name
+        # If propertyUrl is specified, use it, otherwise use the column name
+
+        row_key = frozenset(row.items())
+        cache_key = (csvw_propertyUrl, csvw_name, row_key)
+
+        if cache_key in self.get_property_url_cache:
+            return self.get_property_url_cache[cache_key]
+
         p = None
         propertyUrl = None
         if csvw_propertyUrl is not None:
@@ -737,10 +757,12 @@ class BurstConverter(object):
                     csvw_name]
             else:
                 propertyUrl = "{}{}".format(get_namespaces()['sdv'],
-                    csvw_name)
+                                            csvw_name)
             p = self.expandURL(propertyUrl, row)
-        return p
 
+        self.get_property_url_cache[cache_key] = p
+        return p
+    
     def expandURL(self, url_pattern, row, datatype=False):
         """Takes a Jinja or Python formatted string, applies it to the row values, and returns it as a URIRef"""
 
