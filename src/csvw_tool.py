@@ -18,7 +18,6 @@ from werkzeug.utils import secure_filename
 import codecs
 from pathlib import Path
 
-
 class COW(object):
 
     def __init__(self, mode=None, files=None, dataset=None, delimiter=None,
