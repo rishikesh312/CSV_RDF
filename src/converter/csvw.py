@@ -12,8 +12,9 @@ import rfc3987
 from chardet.universaldetector import UniversalDetector
 import multiprocessing as mp
 import unicodecsv as csv
+import hashlib
+from collections import OrderedDict
 from jinja2 import Template
-from functools import lru_cache
 from .util import (patch_namespaces_to_disk, process_namespaces,
                    get_namespaces, Nanopublication, validateTerm,
                    parse_value, CSVW, PROV, DC, SKOS, RDF)
@@ -22,7 +23,7 @@ from rdflib.resource import Resource
 from rdflib.collection import Collection
 from functools import partial
 from itertools import zip_longest
-
+from functools import lru_cache
 import io
 
 logger = logging.getLogger(__name__)
@@ -361,93 +362,69 @@ class CSVWConverter(object):
     def convert(self):
         """Starts a conversion process (in parallel or as a single process) as defined in the arguments passed to the :class:`CSVWConverter` initialization"""
         logger.info("Starting conversion")
+        writer = gzip.open if self.gzipped else open
 
-        # If the number of processes is set to 1, we start the 'simple' conversion (in a single thread)
-        if self._processes == 1:
-            self._simple()
-        # Otherwise, we start the parallel processing procedure, but fall back to simple conversion
-        # when it turns out that for some reason the parallel processing fails (this happens on some
-        # files. The reason could not yet be determined.)
-        elif self._processes > 1:
-            try:
-                self._parallel()
-            except TypeError:
-                logger.info(
-                    "TypeError in multiprocessing... falling back to serial conversion")
-                self._simple()
-            except Exception:
-                logger.error(
-                    "Some exception occurred, falling back to serial conversion")
-                traceback.print_exc()
-                self._simple()
-        else:
-            logger.error("Incorrect process count specification")
+        with writer(self.target_file, 'wb') as target_file:
+            with open(self.file_name, 'rb') as csvfile:
+                logger.info("Opening CSV file for reading")
+                reader = csv.DictReader(csvfile,
+                                        encoding=self.encoding,
+                                        delimiter=self.delimiter,
+                                        quotechar=self.quotechar)
 
-    def _simple(self):
+                # If single-threaded
+                if self._processes == 1:
+                    self._simple(reader, target_file)
+
+                # If multi-threaded
+                elif self._processes > 1:
+                    try:
+                        self._parallel(reader, target_file)
+                    except TypeError:
+                        logger.info("TypeError in multiprocessing... falling back to serial conversion")
+                        self._simple(reader, target_file)
+                    except Exception:
+                        logger.error("Some exception occurred, falling back to serial conversion")
+                        traceback.print_exc()
+                        self._simple(reader, target_file)
+                else:
+                    logger.error("Incorrect process count specification")
+
+    def _simple(self, reader, target_file):
         """Starts a single process for converting the file"""
-        writer = gzip.open if self.gzipped else open
-        with writer(self.target_file, 'wb') as target_file:
-            with open(self.file_name, 'rb') as csvfile:
-                logger.info("Opening CSV file for reading")
-                reader = csv.DictReader(csvfile,
-                                        encoding=self.encoding,
-                                        delimiter=self.delimiter,
-                                        quotechar=self.quotechar)
+        logger.info("Starting in a single process")
+        c = BurstConverter(self.np.ag.identifier, self.columns,
+                        self.schema, self.metadata_graph, self.encoding, self.output_format)
 
-                logger.info("Starting in a single process")
-                c = BurstConverter(self.np.ag.identifier, self.columns,
-                                   self.schema, self.metadata_graph, self.encoding, self.output_format)
-                # Out will contain an N-Quads serialized representation of the
-                # converted CSV
-                out = c.process(0, reader, 1)
-                # We then write it to the file
-                target_file.write(out.encode())
+        # Out will contain an N-Quads serialized representation of the converted CSV
+        out = c.process(0, reader, 1)
+        target_file.write(out.encode())
 
-            self.convert_info()
-            # Finally, write the nanopublication info to file
-            target_file.write(self.np.serialize(format=self.output_format).encode())
+        self.convert_info()
+        target_file.write(self.np.serialize(format=self.output_format).encode())
 
-    def _parallel(self):
+    def _parallel(self, reader, target_file):
         """Starts parallel processes for converting the file. Each process will receive max ``chunksize`` number of rows"""
-        writer = gzip.open if self.gzipped else open
-        with writer(self.target_file, 'wb') as target_file:
-            with open(self.file_name, 'rb') as csvfile:
-                logger.info("Opening CSV file for reading")
-                reader = csv.DictReader(csvfile,
-                                        encoding=self.encoding,
-                                        delimiter=self.delimiter,
-                                        quotechar=self.quotechar)
+        pool = mp.Pool(processes=self._processes)
+        logger.info(f"Running in {self._processes} processes")
 
-                # Initialize a pool of processes (default=4)
-                pool = mp.Pool(processes=self._processes)
-                logger.info("Running in {} processes".format(self._processes))
+        burstConvert_partial = partial(_burstConvert,
+                                    identifier=self.np.ag.identifier,
+                                    columns=self.columns,
+                                    schema=self.schema,
+                                    metadata_graph=self.metadata_graph,
+                                    encoding=self.encoding,
+                                    chunksize=self._chunksize,
+                                    output_format=self.output_format)
 
-                # The _burstConvert function is partially instantiated, and will be successively called with
-                # chunksize rows from the CSV file
-                # print("LOOOOOOOOOOOOOOOOOOOOOOO")
-                # from pprint import pprint
-                # pprint([term.n3() for term in self.columns])
-                burstConvert_partial = partial(_burstConvert,
-                                               identifier=self.np.ag.identifier,
-                                               columns=self.columns,
-                                               schema=self.schema,
-                                               metadata_graph=self.metadata_graph,
-                                               encoding=self.encoding,
-                                               chunksize=self._chunksize,
-                                               output_format=self.output_format)
+        for out in pool.imap(burstConvert_partial, enumerate(grouper(self._chunksize, reader))):
+            target_file.write(out.encode())
 
-                # The result of each chunksize run will be written to the
-                # target file
-                for out in pool.imap(burstConvert_partial, enumerate(grouper(self._chunksize, reader))):
-                    target_file.write(out.encode())
+        pool.close()
+        pool.join()
 
-                # Make sure to close and join the pool once finished.
-                pool.close()
-                pool.join()
-
-            self.convert_info()
-            # Finally, write the nanopublication info to file
-            target_file.write(self.np.serialize(format=self.output_format).encode())
+        self.convert_info()
+        target_file.write(self.np.serialize(format=self.output_format).encode())
 
 
 def grouper(n, iterable, padvalue=None):
@@ -488,9 +465,9 @@ class BurstConverter(object):
         self.metadata_graph = metadata_graph
         self.encoding = encoding
         self.output_format = output_format
-        self.render_pattern_cache = {}
-        self.expandURL_cache = {}
-        self.get_property_url_cache = {}
+        self.render_pattern_cache = LRUCache(1000)
+        self.expandURL_cache = LRUCache(256)
+        self.get_property_url_cache = LRUCache(10000)
         self.templates = {}
 
         self.aboutURLSchema = self.schema.csvw_aboutUrl
@@ -507,206 +484,358 @@ class BurstConverter(object):
                 return True
         # There is no match with null value
         return False
-
     def process(self, count, rows, chunksize):
-        """Process the rows fed to the converter. Count and chunksize are used to determine the
-        current row number (needed for default observation identifiers)"""
-
         obs_count = count * chunksize
 
-        # logger.info("Row: {}".format(obs_count)) #removed for readability
-
-        # We iterate row by row, and then column by column, as given by the CSVW mapping file.
         mult_proc_counter = 0
-        iter_error_counter= 0
+        iter_error_counter = 0
+
+        columns_data = [
+            {
+                'column_item': Item(self.metadata_graph, c),
+                'csvw_name_str': str(Item(self.metadata_graph, c).csvw_name)
+            }
+            for c in self.columns
+        ]
+
         for row in rows:
-            # This fixes issue:10
             if row is None:
                 mult_proc_counter += 1
-                # logger.debug( #removed for readability
-                #     "Skipping empty row caused by multiprocessing (multiple of chunksize exceeds number of rows in file)...")
                 continue
 
-            # set the '_row' value in case we need to generate 'default' URIs for each observation ()
-            # logger.debug("row: {}".format(obs_count)) #removed for readability
             row['_row'] = obs_count
+            obs_count += 1
             count += 1
-
-            # print(row)
-
-            # The self.columns dictionary gives the mapping definition per column in the 'columns'
-            # array of the CSVW tableSchema definition.
 
             default_subject = self.expandURL(self.aboutURLSchema, row)
 
-            for c in self.columns:
-                s = None
-                c = Item(self.metadata_graph, c)
+            for column_data in columns_data:
+                column_item = column_data['column_item']
+                csvw_name_str = column_data['csvw_name_str']
 
                 try:
-                    # Can also be used to prevent the triggering of virtual
-                    # columns!
+                    value = row[csvw_name_str]
 
-                    # Get the raw value from the cell in the CSV file
-                    value = row[str(c.csvw_name)]
-
-                    # This checks whether we should continue parsing this cell, or skip it.
-                    if self.isValueNull(value, c):
+                    if self.isValueNull(value, column_item):
                         continue
 
-                    # If the null values are specified in an array, we need to parse it as a collection (list)
-                    elif isinstance(c.csvw_null, Item):
-                        nulls = Collection(self.metadata_graph, BNode(c.csvw_null.identifier))
+                    elif isinstance(column_item.csvw_null, Item):
+                        nulls = Collection(self.metadata_graph, BNode(column_item.csvw_null.identifier))
+                        if self.equal_to_null(nulls, row):
+                            continue
 
+                except KeyError:
+                    iter_error_counter += 1
+                    if isinstance(column_item.csvw_null, Item):
+                        nulls = Collection(self.metadata_graph, BNode(column_item.csvw_null.identifier))
                         if self.equal_to_null(nulls, row):
-                            # Continue to next column specification in this row, if the value is equal to (one of) the null values.
                             continue
-                except:
-                    # No column name specified (virtual) because there clearly was no c.csvw_name key in the row.
-                    # logger.debug(traceback.format_exc()) #removed for readability
-                    iter_error_counter +=1
-                    if isinstance(c.csvw_null, Item):
-                        nulls = Collection(self.metadata_graph, BNode(c.csvw_null.identifier))
-                        if self.equal_to_null(nulls, row):
-                            # Continue to next column specification in this row, if the value is equal to (one of) the null values.
-                            continue
+
+                parsed_column_data = {
+                    'csvw_virtual': parse_value(column_item.csvw_virtual),
+                    'csvw_name': csvw_name_str,
+                    'csvw_value': parse_value(column_item.csvw_value),
+                    'csvw_about_url': parse_value(column_item.csvw_aboutUrl),
+                    'csvw_value_url': parse_value(column_item.csvw_valueUrl),
+                    'csvw_datatype': parse_value(column_item.csvw_datatype)
+                }
 
                 try:
-                    # This overrides the subject resource 's' that has been created earlier based on the
-                    # schema wide aboutURLSchema specification.
-
-                    #TODO: set your environment correctly
-                    csvw_virtual = parse_value(c.csvw_virtual)
-                    csvw_name = parse_value(c.csvw_name)
-                    csvw_value = parse_value(c.csvw_value)
-                    csvw_about_url = parse_value(c.csvw_aboutUrl)
-                    csvw_value_url = parse_value(c.csvw_valueUrl)
-                    csvw_datatype = parse_value(c.csvw_datatype)
-
-                    if csvw_about_url is not None:
-                        s = self.expandURL(csvw_about_url, row)
-
-                    p = self.get_property_url(c.csvw_propertyUrl, csvw_name, row)
-
-                    if csvw_value_url is not None:
-                        # This is an object property, because the value needs to be cast to a URL
-                        o = self.expandURL(csvw_value_url, row)
-                        object_value = str(o)
-                        if self.isValueNull(os.path.basename(object_value), c):
-                            logger.debug("skipping empty value")
-                            continue
-
-                        if csvw_virtual == 'true' and csvw_datatype is not None: 
-                            
-                            if URIRef(csvw_datatype) == XSD.anyURI:
-                                # Special case: this is a virtual column with object values that are URIs
-                                # For now using a test special property
-                                value = row[csvw_name]
-                                o = URIRef(iribaker.to_iri(value))
-
-                            if URIRef(csvw_datatype) == XSD.linkURI:
-                                csvw_about_url = csvw_about_url[csvw_about_url.find("{"):csvw_about_url.find("}")+1]
-                                s = self.expandURL(csvw_about_url, row)
-                                # logger.debug("s: {}".format(s))
-                                csvw_value_url = csvw_value_url[csvw_value_url.find("{"):csvw_value_url.find("}")+1]
-                                o = self.expandURL(csvw_value_url, row)
-                                # logger.debug("o: {}".format(o))
-
-                        # For coded properties, the collectionUrl can be used to indicate that the
-                        # value URL is a concept and a member of a SKOS Collection with that URL.
-                        if c.csvw_collectionUrl is not None:
-                            collection = self.expandURL(c.csvw_collectionUrl, row)
-                            self.g.add((collection, RDF.type, SKOS['Collection']))
-                            self.g.add((o, RDF.type, SKOS['Concept']))
-                            self.g.add((collection, SKOS['member'], o))
-
-                        # For coded properties, the schemeUrl can be used to indicate that the
-                        # value URL is a concept and a member of a SKOS Scheme with that URL.
-                        if c.csvw_schemeUrl is not None:
-                            scheme = self.expandURL(c.csvw_schemeUrl, row)
-                            self.g.add((scheme, RDF.type, SKOS['Scheme']))
-                            self.g.add((o, RDF.type, SKOS['Concept']))
-                            self.g.add((o, SKOS['inScheme'], scheme))
-                    else:
-                        # This is a datatype property
-                        if csvw_value is not None:
-                            value = self.render_pattern(csvw_value, row)
-                        elif csvw_name is not None:
-                            # print s
-                            # print c.csvw_name, self.encoding
-                            # print row[unicode(c.csvw_name)], type(row[unicode(c.csvw_name)])
-                            # print row[unicode(c.csvw_name)].encode('utf-8')
-                            # print '...'
-                            value = row[csvw_name]
-                        else:
-                            raise Exception("No 'name' or 'csvw:value' attribute found for this column specification")
-
-                        p = self.get_property_url(c.csvw_propertyUrl, csvw_name, row)
-
-                        if csvw_datatype is not None:
-                            if URIRef(csvw_datatype) == XSD.anyURI:
-                                # The xsd:anyURI datatype will be cast to a proper IRI resource.
-                                o = URIRef(iribaker.to_iri(value))
-                            elif URIRef(csvw_datatype) == XSD.string and c.csvw_lang is not None:
-                                # If it is a string datatype that has a language, we turn it into a
-                                # language tagged literal
-                                # We also render the lang value in case it is a
-                                # pattern.
-                                o = Literal(value, lang=self.render_pattern(
-                                    c.csvw_lang, row))
-                            else:
-                                # csvw_datatype = str(c.csvw_datatype)
-                                # print(type(csvw_datatype))
-                                # print(csvw_datatype)
-                                o = Literal(value, datatype=csvw_datatype, normalize=False)
-                        else:
-                            # It's just a plain literal without datatype.
-                            o = Literal(value)
-
-
-                    # Add the triple to the assertion graph
-                    s = s if s else default_subject
+                    s, p, o = self._process_column(row, default_subject, column_item, parsed_column_data)
                     self.g.add((s, p, o))
 
-                    # Add provenance relating the propertyUrl to the column id
-                    if '@id' in c:
-                        self.g.add((p, PROV['wasDerivedFrom'], URIRef(c['@id'])))
+                    if '@id' in column_item:
+                        self.g.add((p, PROV['wasDerivedFrom'], URIRef(column_item['@id'])))
 
-                except:
-                    # print row[0], value
+                except Exception:
                     traceback.print_exc()
 
-            # We increment the observation (row number) with one
-            obs_count += 1
-
-        # for s,p,o in self.g.triples((None,None,None)):
-        #     print(s.__repr__,p.__repr__,o.__repr__)
-
-        logger.debug(
-            "{} row skips caused by multiprocessing (multiple of chunksize exceeds number of rows in file)...".format(mult_proc_counter))
-        logger.debug(
-            "{} errors encountered while trying to iterate over a NoneType...".format(mult_proc_counter))
+        logger.debug(f"{mult_proc_counter} row skips caused by multiprocessing...")
+        logger.debug(f"{iter_error_counter} errors encountered while trying to iterate over a NoneType...")
         logger.info("... done")
         return self.ds.serialize(format=self.output_format)
 
-    # def serialize(self):
-    #     trig_file_name = self.file_name + '.trig'
-    #     logger.info("Starting serialization to {}".format(trig_file_name))
-    #
-    #     with open(trig_file_name, 'w') as f:
-    #         self.np.serialize(f, format='trig')
-    #     logger.info("... done")
-#        self.render_pattern_cache = {}
-#        self.expandURL_cache = {}
-#        self.get_property_url_cache = {}
+    def _process_column(self, row, default_subject, column_item, parsed_column_data):
+        """This is a helper method to process each column item."""
+
+        csvw_virtual = parsed_column_data['csvw_virtual']
+        csvw_name = parsed_column_data['csvw_name']
+        csvw_value = parsed_column_data['csvw_value']
+        csvw_about_url = parsed_column_data['csvw_about_url']
+        csvw_value_url = parsed_column_data['csvw_value_url']
+        csvw_datatype = parsed_column_data['csvw_datatype']
+
+        if csvw_about_url is not None:
+            s = self.expandURL(csvw_about_url, row)
+        else:
+            s = default_subject
+
+        p = self.get_property_url(column_item.csvw_propertyUrl, csvw_name, row)
+
+        # Object property logic
+        if csvw_value_url is not None:
+            o = self.expandURL(csvw_value_url, row)
+            object_value = str(o)
+            if self.isValueNull(os.path.basename(object_value), column_item):
+                return s, p, None
+
+            if csvw_virtual == 'true' and csvw_datatype:
+                if URIRef(csvw_datatype) == XSD.anyURI:
+                    value = row[csvw_name]
+                    o = URIRef(iribaker.to_iri(value))
+
+                if URIRef(csvw_datatype) == XSD.linkURI:
+                    csvw_about_url = self._extract_between_braces(csvw_about_url)
+                    s = self.expandURL(csvw_about_url, row)
+                    csvw_value_url = self._extract_between_braces(csvw_value_url)
+                    o = self.expandURL(csvw_value_url, row)
+
+            if column_item.csvw_collectionUrl is not None:
+                self._handle_collection_url(column_item, o, row)
+
+            if column_item.csvw_schemeUrl is not None:
+                self._handle_scheme_url(column_item, o, row)
+
+        else:
+            value = self._determine_value(row, column_item, csvw_value, csvw_name)
+            o = self._determine_object(value, csvw_datatype, column_item.csvw_lang, row)
+
+        return s, p, o
+
+    def _determine_value(self, row, column_item, csvw_value, csvw_name):
+        if csvw_value is not None:
+            return self.render_pattern(csvw_value, row)
+        elif csvw_name is not None:
+            return row[csvw_name]
+        else:
+            raise Exception("No 'name' or 'csvw:value' attribute found for this column specification")
+
+    def _determine_object(self, value, csvw_datatype, csvw_lang, row):
+        if csvw_datatype is not None:
+            if URIRef(csvw_datatype) == XSD.anyURI:
+                return URIRef(iribaker.to_iri(value))
+            elif URIRef(csvw_datatype) == XSD.string and csvw_lang is not None:
+                return Literal(value, lang=self.render_pattern(csvw_lang, row))
+            else:
+                return Literal(value, datatype=csvw_datatype, normalize=False)
+        return Literal(value)
+
+    def _extract_between_braces(self, value):
+        return value[value.find("{"):value.find("}")+1]
+
+    def _handle_collection_url(self, column_item, o, row):
+        collection = self.expandURL(column_item.csvw_collectionUrl, row)
+        self.g.add((collection, RDF.type, SKOS['Collection']))
+        self.g.add((o, RDF.type, SKOS['Concept']))
+        self.g.add((collection, SKOS['member'], o))
+
+    def _handle_scheme_url(self, column_item, o, row):
+        scheme = self.expandURL(column_item.csvw_schemeUrl, row)
+        self.g.add((scheme, RDF.type, SKOS['Scheme']))
+        self.g.add((o, RDF.type, SKOS['Concept']))
+        self.g.add((o, SKOS['inScheme'], scheme))
+
+#    def process(self, count, rows, chunksize):
+#        """Process the rows fed to the converter. Count and chunksize are used to determine the
+#        current row number (needed for default observation identifiers)"""
+#
+#        obs_count = count * chunksize
+#
+#        # logger.info("Row: {}".format(obs_count)) #removed for readability
+#
+#        # We iterate row by row, and then column by column, as given by the CSVW mapping file.
+#        mult_proc_counter = 0
+#        iter_error_counter= 0
+#        for row in rows:
+#            # This fixes issue:10
+#            if row is None:
+#                mult_proc_counter += 1
+#                # logger.debug( #removed for readability
+#                #     "Skipping empty row caused by multiprocessing (multiple of chunksize exceeds number of rows in file)...")
+#                continue
+#
+#            # set the '_row' value in case we need to generate 'default' URIs for each observation ()
+#            # logger.debug("row: {}".format(obs_count)) #removed for readability
+#            row['_row'] = obs_count
+#            count += 1
+#
+#            # print(row)
+#
+#            # The self.columns dictionary gives the mapping definition per column in the 'columns'
+#            # array of the CSVW tableSchema definition.
+#
+#            default_subject = self.expandURL(self.aboutURLSchema, row)
+#
+#            for c in self.columns:
+#                s = None
+#                c = Item(self.metadata_graph, c)
+#
+#                try:
+#                    # Can also be used to prevent the triggering of virtual
+#                    # columns!
+#
+#                    # Get the raw value from the cell in the CSV file
+#                    value = row[str(c.csvw_name)]
+#
+#                    # This checks whether we should continue parsing this cell, or skip it.
+#                    if self.isValueNull(value, c):
+#                        continue
+#
+#                    # If the null values are specified in an array, we need to parse it as a collection (list)
+#                    elif isinstance(c.csvw_null, Item):
+#                        nulls = Collection(self.metadata_graph, BNode(c.csvw_null.identifier))
+#
+#                        if self.equal_to_null(nulls, row):
+#                            # Continue to next column specification in this row, if the value is equal to (one of) the null values.
+#                            continue
+#                except:
+#                    # No column name specified (virtual) because there clearly was no c.csvw_name key in the row.
+#                    # logger.debug(traceback.format_exc()) #removed for readability
+#                    iter_error_counter +=1
+#                    if isinstance(c.csvw_null, Item):
+#                        nulls = Collection(self.metadata_graph, BNode(c.csvw_null.identifier))
+#                        if self.equal_to_null(nulls, row):
+#                            # Continue to next column specification in this row, if the value is equal to (one of) the null values.
+#                            continue
+#
+#                try:
+#                    # This overrides the subject resource 's' that has been created earlier based on the
+#                    # schema wide aboutURLSchema specification.
+#
+#                    #TODO: set your environment correctly
+#                    csvw_virtual = parse_value(c.csvw_virtual)
+#                    csvw_name = parse_value(c.csvw_name)
+#                    csvw_value = parse_value(c.csvw_value)
+#                    csvw_about_url = parse_value(c.csvw_aboutUrl)
+#                    csvw_value_url = parse_value(c.csvw_valueUrl)
+#                    csvw_datatype = parse_value(c.csvw_datatype)
+#
+#                    if csvw_about_url is not None:
+#                        s = self.expandURL(csvw_about_url, row)
+#
+#                    p = self.get_property_url(c.csvw_propertyUrl, csvw_name, row)
+#
+#                    if csvw_value_url is not None:
+#                        # This is an object property, because the value needs to be cast to a URL
+#                        o = self.expandURL(csvw_value_url, row)
+#                        object_value = str(o)
+#                        if self.isValueNull(os.path.basename(object_value), c):
+#                            logger.debug("skipping empty value")
+#                            continue
+#
+#                        if csvw_virtual == 'true' and csvw_datatype is not None: 
+#                            
+#                            if URIRef(csvw_datatype) == XSD.anyURI:
+#                                # Special case: this is a virtual column with object values that are URIs
+#                                # For now using a test special property
+#                                value = row[csvw_name]
+#                                o = URIRef(iribaker.to_iri(value))
+#
+#                            if URIRef(csvw_datatype) == XSD.linkURI:
+#                                csvw_about_url = csvw_about_url[csvw_about_url.find("{"):csvw_about_url.find("}")+1]
+#                                s = self.expandURL(csvw_about_url, row)
+#                                # logger.debug("s: {}".format(s))
+#                                csvw_value_url = csvw_value_url[csvw_value_url.find("{"):csvw_value_url.find("}")+1]
+#                                o = self.expandURL(csvw_value_url, row)
+#                                # logger.debug("o: {}".format(o))
+#
+#                        # For coded properties, the collectionUrl can be used to indicate that the
+#                        # value URL is a concept and a member of a SKOS Collection with that URL.
+#                        if c.csvw_collectionUrl is not None:
+#                            collection = self.expandURL(c.csvw_collectionUrl, row)
+#                            self.g.add((collection, RDF.type, SKOS['Collection']))
+#                            self.g.add((o, RDF.type, SKOS['Concept']))
+#                            self.g.add((collection, SKOS['member'], o))
+#
+#                        # For coded properties, the schemeUrl can be used to indicate that the
+#                        # value URL is a concept and a member of a SKOS Scheme with that URL.
+#                        if c.csvw_schemeUrl is not None:
+#                            scheme = self.expandURL(c.csvw_schemeUrl, row)
+#                            self.g.add((scheme, RDF.type, SKOS['Scheme']))
+#                            self.g.add((o, RDF.type, SKOS['Concept']))
+#                            self.g.add((o, SKOS['inScheme'], scheme))
+#                    else:
+#                        # This is a datatype property
+#                        if csvw_value is not None:
+#                            value = self.render_pattern(csvw_value, row)
+#                        elif csvw_name is not None:
+#                            # print s
+#                            # print c.csvw_name, self.encoding
+#                            # print row[unicode(c.csvw_name)], type(row[unicode(c.csvw_name)])
+#                            # print row[unicode(c.csvw_name)].encode('utf-8')
+#                            # print '...'
+#                            value = row[csvw_name]
+#                        else:
+#                            raise Exception("No 'name' or 'csvw:value' attribute found for this column specification")
+#
+#                        p = self.get_property_url(c.csvw_propertyUrl, csvw_name, row)
+#
+#                        if csvw_datatype is not None:
+#                            if URIRef(csvw_datatype) == XSD.anyURI:
+#                                # The xsd:anyURI datatype will be cast to a proper IRI resource.
+#                                o = URIRef(iribaker.to_iri(value))
+#                            elif URIRef(csvw_datatype) == XSD.string and c.csvw_lang is not None:
+#                                # If it is a string datatype that has a language, we turn it into a
+#                                # language tagged literal
+#                                # We also render the lang value in case it is a
+#                                # pattern.
+#                                o = Literal(value, lang=self.render_pattern(
+#                                    c.csvw_lang, row))
+#                            else:
+#                                # csvw_datatype = str(c.csvw_datatype)
+#                                # print(type(csvw_datatype))
+#                                # print(csvw_datatype)
+#                                o = Literal(value, datatype=csvw_datatype, normalize=False)
+#                        else:
+#                            # It's just a plain literal without datatype.
+#                            o = Literal(value)
+#
+#
+#                    # Add the triple to the assertion graph
+#                    s = s if s else default_subject
+#                    self.g.add((s, p, o))
+#
+#                    # Add provenance relating the propertyUrl to the column id
+#                    if '@id' in c:
+#                        self.g.add((p, PROV['wasDerivedFrom'], URIRef(c['@id'])))
+#
+#                except:
+#                    # print row[0], value
+#                    traceback.print_exc()
+#
+#            # We increment the observation (row number) with one
+#            obs_count += 1
+#
+#        # for s,p,o in self.g.triples((None,None,None)):
+#        #     print(s.__repr__,p.__repr__,o.__repr__)
+#
+#        logger.debug(
+#            "{} row skips caused by multiprocessing (multiple of chunksize exceeds number of rows in file)...".format(mult_proc_counter))
+#        logger.debug(
+#            "{} errors encountered while trying to iterate over a NoneType...".format(mult_proc_counter))
+#        logger.info("... done")
+#        return self.ds.serialize(format=self.output_format)
+#
+#    # def serialize(self):
+#    #     trig_file_name = self.file_name + '.trig'
+#    #     logger.info("Starting serialization to {}".format(trig_file_name))
+#    #
+#    #     with open(trig_file_name, 'w') as f:
+#    #         self.np.serialize(f, format='trig')
+#    #     logger.info("... done")
+##        self.render_pattern_cache = {}
+##        self.expandURL_cache = {}
+##        self.get_property_url_cache = {}
+    
     def render_pattern(self, pattern, row):
         """Takes a Jinja or Python formatted string, and applies it to the row value"""
         # Significant speedup by not re-instantiating Jinja templates for every
         # row.
         row_key = frozenset(row.items())
         cache_key = (pattern,row_key)
-        if cache_key in self.render_pattern_cache:
-            return self.render_pattern_cache[cache_key]
+        cache_value = self.render_pattern_cache.get(cache_key)
+        if cache_value:
+            return cache_value
         
         if pattern in self.templates:
             template = self.templates[pattern]
@@ -735,7 +864,7 @@ class BurstConverter(object):
                 "Could not apply python string formatting, probably due to mismatched curly brackets. IRI will be '{}'. ".format(rendered_template))
             result = rendered_template.format(**row)
         
-        self.render_pattern_cache[cache_key] = result
+        self.render_pattern_cache.put(cache_key,result)
         return result
 
     def get_property_url(self, csvw_propertyUrl, csvw_name, row):
@@ -743,10 +872,10 @@ class BurstConverter(object):
 
         row_key = frozenset(row.items())
         cache_key = (csvw_propertyUrl, csvw_name, row_key)
-
-        if cache_key in self.get_property_url_cache:
-            return self.get_property_url_cache[cache_key]
-
+        cache_value = self.get_property_url_cache.get(cache_key)
+        if cache_value:
+            return cache_value
+        
         p = None
         propertyUrl = None
         if csvw_propertyUrl is not None:
@@ -760,30 +889,29 @@ class BurstConverter(object):
                                             csvw_name)
             p = self.expandURL(propertyUrl, row)
 
-        self.get_property_url_cache[cache_key] = p
+        self.get_property_url_cache.put(cache_key,p)
         return p
     
+
     def expandURL(self, url_pattern, row, datatype=False):
         """Takes a Jinja or Python formatted string, applies it to the row values, and returns it as a URIRef"""
-
         unicode_url_pattern = parse_value(url_pattern)
+        row_key = frozenset(row.items())
+        cache_key = (url_pattern, row_key)
+        cache_value = self.expandURL_cache.get(cache_key)
+        if cache_value:
+            return cache_value
 
         url = self.render_pattern(unicode_url_pattern, row)
-
-        # DEPRECATED
-        # for ns, nsuri in namespaces.items():
-        #     if url.startswith(ns):
-        #         url = url.replace(ns + ':', nsuri)
-        #         break
-
         try:
             iri = iribaker.to_iri(url)
             rfc3987.parse(iri, rule='IRI')
-        except:
+        except: 
             raise Exception("Cannot convert `{}` to valid IRI".format(url))
-
-        return URIRef(iri)
-
+        iri = URIRef(iri)
+        self.expandURL_cache.put(cache_key,iri)
+        return iri
+    
     def isValueNull(self, value, c):
         """This checks whether we should continue parsing this cell, or skip it because it is empty or a null value."""
         try:
@@ -799,3 +927,27 @@ class BurstConverter(object):
             # logger.debug("null does not exist or is not a list.") #this line will print for every cell in a csv without a defined null value.
             pass
         return False
+    
+class LRUCache:
+
+    def __init__(self,capacity = 256):
+        self.capacity = capacity
+        self.data = OrderedDict()
+        self.key_set = set()
+
+    def get(self,key):
+        if key in self.key_set:
+            value = self.data.pop(key)
+            self.data[key] = value
+            return value
+        return None
+
+    def put(self,key,value):
+        if key in self.key_set:
+            self.data.pop(key)
+        elif len(self.data) >= self.capacity:
+            self.key_set.remove(next(iter(self.data)))
+            self.data.popitem(last=False)
+        self.data[key] = value
+        self.key_set.add(key)
+

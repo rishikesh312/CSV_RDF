@@ -95,7 +95,7 @@ def main():
     parser.add_argument('--delimiter', dest='delimiter', default=None, type=str, help="The delimiter used in the CSV file(s)")
     parser.add_argument('--quotechar', dest='quotechar', default='\"', type=str, help="The character used as quotation character in the CSV file(s)")
     parser.add_argument('--encoding', dest='encoding', default=None, type=str, help="The character encoding used in the CSV file(s)")
-    parser.add_argument('--processes', dest='processes', default='1', type=int, help="The number of processes the converter should use")
+    parser.add_argument('--processes', dest='processes', default='4', type=int, help="The number of processes the converter should use")
     parser.add_argument('--chunksize', dest='chunksize', default='5000', type=int, help="The number of rows processed at each time")
     parser.add_argument('--gzip', action='store_true', help="Compress the output using gzip")
     parser.add_argument('--base', dest='base', default='https://example.com/id/', type=str, help="The base for URIs generated with the schema (only relevant when `build`ing a schema)")
@@ -120,7 +120,7 @@ def main():
         args.format, args.gzip)
 
 if __name__ == '__main__':
-   cProfile.run("main()")
+   main()
 
 # FILE = '../sdh-private-hisco-datasets/hisco_45.csv'
 # SCHEMA = '../sdh-private-hisco-datasets/hisco_45.csv-metadata.json'
