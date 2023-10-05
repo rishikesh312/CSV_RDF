@@ -120,7 +120,7 @@ def main():
         args.format, args.gzip)
 
 if __name__ == '__main__':
-   main()
+   cProfile.run("main()")
 
 # FILE = '../sdh-private-hisco-datasets/hisco_45.csv'
 # SCHEMA = '../sdh-private-hisco-datasets/hisco_45.csv-metadata.json'

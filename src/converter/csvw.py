@@ -45,6 +45,7 @@ UTF8 = 'utf-8'
 def build_schema(infile, outfile, delimiter=None, quotechar='\"',
                  encoding=None, dataset_name=None,
                  base="https://example.com/id/"):
+    
     """
     Build a CSVW schema based on the ``infile`` CSV file, and write the
     resulting JSON CSVW schema to ``outfile``.
@@ -927,7 +928,8 @@ class BurstConverter(object):
             # logger.debug("null does not exist or is not a list.") #this line will print for every cell in a csv without a defined null value.
             pass
         return False
-    
+
+#Least Recently used Cache    
 class LRUCache:
 
     def __init__(self,capacity = 256):
@@ -935,13 +937,15 @@ class LRUCache:
         self.data = OrderedDict()
         self.key_set = set()
 
+
+#Gets the data the cache
     def get(self,key):
         if key in self.key_set:
             value = self.data.pop(key)
             self.data[key] = value
             return value
         return None
-
+#adding the data to cache
     def put(self,key,value):
         if key in self.key_set:
             self.data.pop(key)
