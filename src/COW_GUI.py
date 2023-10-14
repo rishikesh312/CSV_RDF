@@ -12,7 +12,7 @@ class COWGUI(QMainWindow):
         self.initUI()
 
     def initUI(self):
-        self.setWindowTitle('CSVW Converter GUI')
+        self.setWindowTitle('CSV on the Web Converter GUI')
         self.setGeometry(100, 100, 400, 200)
 
         self.central_widget = QWidget(self)
